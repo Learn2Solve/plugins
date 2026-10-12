@@ -12,7 +12,8 @@
 //   POST /stop     → stops the runner (a package of another version starts
 //                    its own bridge)
 // Each generate is billed to the account through one private thread, made
-// on the first request and kept in <dir>/thread. When no request has come
+// on the first request and kept in <dir>/thread (made again when it was
+// deleted in Amp). When no request has come
 // for <dir>/idle minutes (the package writes it; 30 if not), the runner is
 // stopped: the package starts it again on the next request.
 import type { PluginAPI } from '@ampcode/plugin'
@@ -67,6 +68,20 @@ export default function (amp: PluginAPI) {
 		})().finally(() => (making = null))
 		return making
 	}
+	// A billing thread deleted in Amp (or with `amp threads delete`) fails
+	// every generate with "Thread not found": another is made, and the
+	// request is asked once more.
+	const generate = async (request: any) => {
+		const id = await billing()
+		try {
+			return await amp.ai.generate({ ...request, threadID: id })
+		} catch (e) {
+			if (!/thread not found/i.test(String((e as Error)?.message ?? e))) throw e
+			amp.logger.log(`magpie bridge: thread ${id} is gone, making another`)
+			if (thread === id) thread = ''
+			return amp.ai.generate({ ...request, threadID: await billing() })
+		}
+	}
 
 	const idleMinutes = Number(read('idle')) || 30
 	let last = Date.now()
@@ -114,12 +129,12 @@ export default function (amp: PluginAPI) {
 			busy++
 			last = Date.now()
 			try {
-				const request: any = { threadID: await billing(), model: body.model, prompt: String(body.prompt ?? '') }
+				const request: any = { model: body.model, prompt: String(body.prompt ?? '') }
 				if (typeof body.system === 'string' && body.system) request.system = body.system
 				if (Number.isInteger(body.maxTokens) && body.maxTokens > 0) request.maxTokens = body.maxTokens
 				if (typeof body.reasoningEffort === 'string' && body.reasoningEffort) request.reasoningEffort = body.reasoningEffort
 				if (body.schema && typeof body.schema === 'object') request.schema = body.schema
-				return reply(200, { result: await amp.ai.generate(request) })
+				return reply(200, { result: await generate(request) })
 			} catch (e) {
 				return reply(502, { error: String((e as Error)?.message ?? e) })
 			} finally {

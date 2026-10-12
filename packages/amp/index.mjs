@@ -24,7 +24,7 @@
 // - a streamed request is answered once the whole turn is in, as one
 //   stream, so that a failure is still an HTTP error magpie can fall back
 //   from.
-import { execFile, spawn } from "node:child_process"
+import { execFile, execFileSync, spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
@@ -48,6 +48,9 @@ const MAX_TOKENS = 128_000
 const DEFAULT_MAX_TOKENS = 32_000
 const START_WAIT = 60_000
 const CLI_WAIT = 20_000
+// how long a runner of the folder's that still runs is given for its bridge
+// to answer, before it is stopped (changed by the tests)
+const WAITS = { runner: 15_000 }
 
 // models offered before the account's list is read (and OpenCode's config):
 // the ones a coding agent's tool calls were tried with
@@ -183,9 +186,49 @@ async function start(d, key) {
     return start(d, key)
   }
   try {
+    // The runner last started here may still run: Amp starts a plugin's
+    // process again as the runner starts, so for a moment the bridge's port
+    // is one nobody answers. That runner is waited for, not started twice:
+    // a second exits at once ("Another Amp process is already serving
+    // remote threads"), and runner.pid would then name it, not the runner
+    // left running, which the bridge would never stop. One whose bridge
+    // never answers is stopped.
+    const old = ourRunner(d)
+    if (old) {
+      try {
+        return await waitFor(d, key, () => (alive(old) ? null : "gone"), join(d, "runner.log"), WAITS.runner)
+      } catch {}
+      try {
+        process.kill(old, "SIGTERM")
+      } catch {}
+      for (let i = 0; i < 40 && alive(old); i++) await new Promise((r) => setTimeout(r, 250))
+    }
     return await spawnRunner(exe, d, key)
   } finally {
     rmSync(lock, { force: true })
+  }
+}
+
+// ourRunner is the pid of the runner this package last started in d, while
+// it runs: told by its command line, never a process that took its number
+function ourRunner(d) {
+  if (process.platform === "win32") return 0
+  const pid = Number(readText(join(d, "runner.pid")))
+  const id = readText(join(d, "runner-id"))
+  if (!pid || !id || !alive(pid)) return 0
+  try {
+    return execFileSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8", timeout: 2000 }).includes(`--runner-id ${id}`) ? pid : 0
+  } catch {
+    return 0
+  }
+}
+
+function alive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return e?.code === "EPERM"
   }
 }
 
@@ -217,8 +260,8 @@ async function spawnRunner(exe, d, key) {
 }
 
 // waitFor waits for the bridge to say its port, or the runner to stop
-async function waitFor(d, key, exited, log) {
-  const until = Date.now() + START_WAIT
+async function waitFor(d, key, exited, log, wait = START_WAIT) {
+  const until = Date.now() + wait
   while (Date.now() < until) {
     await new Promise((r) => setTimeout(r, 250))
     const port = readText(join(d, "port"))
@@ -227,7 +270,7 @@ async function waitFor(d, key, exited, log) {
   }
   const said = lastLine(plain(readText(log)))
   throw Object.assign(
-    new Error(exited() !== null ? `amp --no-tui stopped (${exited()})${said ? `: ${said}` : ""}` : `the Amp bridge didn't start in ${START_WAIT / 1000}s; see ${log}`),
+    new Error(exited() !== null ? `amp --no-tui stopped (${exited()})${said ? `: ${said}` : ""}` : `the Amp bridge didn't start in ${wait / 1000}s; see ${log}`),
     { status: 503 },
   )
 }
@@ -851,4 +894,4 @@ export async function AmpAuthPlugin() {
 }
 
 // for tests
-export const _internal = { salvage, dir, amp, bridge, ampError, nearest, availableEfforts, text, transcript, system, turnSchema, parseCalls, repairArgs, listModels, turn, answer, readUsage, BRIDGE_VERSION, EFFORTS, full, shortOf, runtimeModel, reset: () => ((known = null), full.clear(), SEED.forEach(([f]) => full.set(shortOf(f), f))) }
+export const _internal = { salvage, dir, amp, bridge, ampError, nearest, availableEfforts, text, transcript, system, turnSchema, parseCalls, repairArgs, listModels, turn, answer, readUsage, BRIDGE_VERSION, EFFORTS, WAITS, full, shortOf, runtimeModel, reset: () => ((known = null), full.clear(), SEED.forEach(([f]) => full.set(shortOf(f), f))) }

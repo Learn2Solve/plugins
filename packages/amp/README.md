@@ -30,7 +30,8 @@ and the routes older Amp clients called (`/api/provider/…`) now answer
    with the key in the folder's `key` (a random one, mode 0600).
 3. Each chat completion is one `amp.ai.generate` (two at times, see
    [Tool calls](#tool-calls)), billed through one private thread the bridge
-   makes once and keeps in `thread`.
+   makes once and keeps in `thread` (and makes again if you delete it in
+   Amp).
 4. When no request has come for 30 minutes (`MAGPIE_AMP_IDLE_MINUTES`),
    the bridge stops the runner. The next request starts it again, in
    about 2 seconds.

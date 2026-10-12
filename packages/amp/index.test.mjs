@@ -363,6 +363,58 @@ test.skipIf(process.platform === "win32")("with no bridge answering, amp --no-tu
   }
 })
 
+// oldRunner stands in for a runner this package started in the folder before:
+// a process whose command line has the folder's runner id
+function oldRunner(id) {
+  const d = process.env.MAGPIE_AMP_DIR
+  writeFileSync(join(d, "runner-id"), id)
+  const p = Bun.spawn(["sh", "-c", "sleep 30; true", "sh", "--no-tui", "--runner-id", id])
+  writeFileSync(join(d, "runner.pid"), String(p.pid))
+  return p
+}
+
+test.skipIf(process.platform === "win32")("a runner of the folder's that still runs is waited for, not started again", async () => {
+  // its bridge's process is between two starts: the port is one nobody answers
+  const d = process.env.MAGPIE_AMP_DIR
+  const marker = join(d, "started")
+  fakeAmp({ runner: `touch "${marker}"; exit 1` })
+  writeFileSync(join(d, "key"), "amb-test")
+  const old = oldRunner("magpie-test0001")
+  writeFileSync(join(d, "port"), "1")
+  let b
+  const later = setTimeout(() => (b = fakeBridge(() => "OK")), 500)
+  try {
+    const r = await chat({ model: "kimi-k3", messages: [{ role: "user", content: "hi" }] })
+    expect(r.status).toBe(200)
+    expect(existsSync(marker)).toBe(false)
+    expect(readFileSync(join(d, "runner.pid"), "utf8")).toBe(String(old.pid))
+  } finally {
+    clearTimeout(later)
+    b?.stop()
+    old.kill()
+  }
+})
+
+test.skipIf(process.platform === "win32")("a runner of the folder's whose bridge never answers is stopped, and another started", async () => {
+  fakeAmp({ runner: `exec "${process.execPath}" "${RUNNER}"` })
+  const d = process.env.MAGPIE_AMP_DIR
+  const old = oldRunner("magpie-test0002")
+  const wait = _internal.WAITS.runner
+  _internal.WAITS.runner = 300
+  try {
+    const r = await chat({ model: "kimi-k3", messages: [{ role: "user", content: "hi" }] })
+    expect(r.status).toBe(200)
+    expect(await Promise.race([old.exited.then(() => "stopped"), new Promise((ok) => setTimeout(() => ok("running"), 3000))])).toBe("stopped")
+    expect(readFileSync(join(d, "runner.pid"), "utf8")).not.toBe(String(old.pid))
+  } finally {
+    _internal.WAITS.runner = wait
+    old.kill()
+    const port = readFileSync(join(d, "port"), "utf8")
+    const key = readFileSync(join(d, "key"), "utf8")
+    await fetch(`http://127.0.0.1:${port}/stop`, { method: "POST", headers: { authorization: `Bearer ${key}` } }).catch(() => {})
+  }
+})
+
 test("a runner that stops at once says what it printed", async () => {
   fakeAmp({ runner: `echo "Error: You are not logged in. Run amp login." >&2; exit 1` })
   const r = await chat({ model: "kimi-k3", messages: [{ role: "user", content: "hi" }] })
@@ -439,4 +491,47 @@ test("an object whose calls are in its content answers with them", async () => {
   } finally {
     b.stop()
   }
+})
+
+test("the bridge makes another billing thread when its own was deleted", async () => {
+  // bridge.ts itself, with a fake amp: the thread in <dir>/thread was
+  // deleted in Amp, as `amp threads delete` does
+  const dir = mkdtempSync(join(root, "bridge-"))
+  writeFileSync(join(dir, "key"), "k")
+  writeFileSync(join(dir, "thread"), "T-gone")
+  const before = process.env.MAGPIE_AMP_DIR
+  process.env.MAGPIE_AMP_DIR = dir
+  const { default: bridge } = await import("./bridge.ts")
+  if (before === undefined) delete process.env.MAGPIE_AMP_DIR
+  else process.env.MAGPIE_AMP_DIR = before
+  const asked = []
+  let made = 0
+  bridge({
+    logger: { log() {} },
+    getBuiltinAgent: () => ({ createThread: async () => ({ id: `T-new${++made}` }) }),
+    ai: {
+      generate: async (r) => {
+        asked.push(r.threadID)
+        if (r.prompt === "other") throw new Error("request failed (500): something else")
+        if (r.threadID === "T-gone") throw new Error(`Failed to create thread-actors thread: 500 {"error":"Failed to create thread actor: Thread not found: T-gone"}`)
+        return "OK"
+      },
+    },
+  })
+  const generate = (prompt) =>
+    fetch(`http://127.0.0.1:${readFileSync(join(dir, "port"), "utf8")}/generate`, {
+      method: "POST",
+      headers: { authorization: "Bearer k" },
+      body: JSON.stringify({ model: "google/gemini-3.8-flash", prompt }),
+    })
+  const r = await generate("hi")
+  expect(r.status).toBe(200)
+  expect(await r.json()).toEqual({ result: "OK" })
+  expect(asked).toEqual(["T-gone", "T-new1"])
+  expect(readFileSync(join(dir, "thread"), "utf8")).toBe("T-new1")
+  // another failure is not asked again, and keeps the thread
+  const e = await generate("other")
+  expect(e.status).toBe(502)
+  expect(asked).toEqual(["T-gone", "T-new1", "T-new1"])
+  expect(made).toBe(1)
 })
